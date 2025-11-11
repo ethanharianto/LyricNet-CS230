@@ -4,7 +4,7 @@
 David Maemoto, Ethan Harianto, Sarah Dong  
 Stanford University
 
-## 🎯 Project Overview
+## Project Overview
 
 LyricNet is a multimodal deep learning system that combines lyrics and audio features to predict song emotions. This implementation integrates:
 - **Lyrics analysis** using BERT-based text encoding
@@ -13,7 +13,7 @@ LyricNet is a multimodal deep learning system that combines lyrics and audio fea
 
 We compare three approaches: a lyrics-only baseline, an audio-only baseline, and a multimodal fusion model that combines both modalities.
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 lyricnet/
@@ -34,7 +34,7 @@ lyricnet/
 └── README.md                  # This file
 ```
 
-## 🚀 Reproduction Instructions
+## Reproduction Instructions
 
 To reproduce our results, follow these steps:
 
@@ -128,7 +128,7 @@ To compare all models:
 python compare_models.py
 ```
 
-## 📊 Results
+## Results
 
 This implementation provides:
 
@@ -147,7 +147,7 @@ This implementation provides:
 - Analysis of multimodal fusion benefits
 - Visualization of results
 
-## 🔧 Configuration
+## Configuration
 
 Key hyperparameters can be adjusted in `config.py`:
 
@@ -167,7 +167,7 @@ MAX_LYRIC_LENGTH = 512      # BERT max sequence length
 MIN_SAMPLES_PER_CLASS = 50  # Minimum samples per emotion class
 ```
 
-## 🐛 Common Issues and Solutions
+## Common Issues and Solutions
 
 ### Kaggle download issues
 
@@ -211,7 +211,7 @@ python data/preprocess.py
 ls -la data/processed/
 ```
 
-## 📈 Advanced Usage
+## Advanced Usage
 
 ### Training with custom hyperparameters
 
@@ -249,7 +249,7 @@ python models/baseline_models.py
 python models/multimodal_model.py
 ```
 
-## 📝 Model Architecture Details
+## Model Architecture Details
 
 ### Lyrics-Only Baseline
 ```
@@ -291,7 +291,7 @@ BERT → 768-dim           MLP → 768-dim
     Output: Emotion logits
 ```
 
-## 📈 Model Analysis
+## Model Analysis
 
 ### Performance Metrics
 
@@ -323,7 +323,7 @@ The evaluation scripts produce:
 - Training curves (loss and accuracy over epochs)
 - Model comparison charts
 
-## 🚧 Future Work
+## Future Work
 
 Potential extensions to this work include:
 
@@ -335,14 +335,14 @@ Potential extensions to this work include:
 - Ensemble methods combining multiple model architectures
 - Extensive hyperparameter optimization
 
-## 📚 References
+## References
 
 - Aljanaki et al. (2017). Developing a Benchmark for Emotional Analysis of Music
 - Panda et al. (2013). Multi-Modal Music Emotion Recognition
 - Pyrovolakis et al. (2022). Multi-Modal Song Mood Detection with Deep Learning
 - Devlin et al. (2018). BERT: Pre-training of Deep Bidirectional Transformers
 
-## 📧 Contact
+## Contact
 
 For questions about this implementation:
 
