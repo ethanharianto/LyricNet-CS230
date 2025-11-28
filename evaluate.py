@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import torch
 import torch.nn as nn
+import torch.optim as optim
 from sklearn.metrics import (
     classification_report, confusion_matrix,
     accuracy_score, f1_score, precision_score, recall_score
@@ -24,10 +25,10 @@ from models.baseline_models import LyricsOnlyModel, AudioOnlyModel
 from models.multimodal_model import MultimodalFusionModel
 from models.data_loader import get_data_loaders, load_label_mappings
 
-from config import DEVICE, MODEL_DIR
+from config import DEVICE, MODEL_DIR, TEMPERATURE_SCALING_MAX_ITERS
 
 
-def load_model(model_type, num_classes):
+def load_model(model_type, num_classes, run_name=None):
     """Load trained model."""
     print(f"Loading {model_type} model...")
     
@@ -41,8 +42,8 @@ def load_model(model_type, num_classes):
     else:
         raise ValueError(f"Unknown model type: {model_type}")
     
-    # Load weights
-    model_path = os.path.join(MODEL_DIR, f'{model_type}_best.pth')
+    checkpoint_name = run_name or f"{model_type}_best"
+    model_path = os.path.join(MODEL_DIR, f'{checkpoint_name}.pth')
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}\nPlease train the model first.")
     
@@ -55,7 +56,7 @@ def load_model(model_type, num_classes):
     return model
 
 
-def get_predictions(model, data_loader, model_type):
+def get_predictions(model, data_loader, model_type, temperature=1.0):
     """Get predictions for entire dataset."""
     model.eval()
     all_predictions = []
@@ -78,14 +79,59 @@ def get_predictions(model, data_loader, model_type):
                 logits = model(input_ids, attention_mask, audio_features)
             
             # Get predictions and probabilities
-            probabilities = torch.softmax(logits, dim=1)
-            _, predicted = torch.max(logits, 1)
+            scaled_logits = logits / temperature
+            probabilities = torch.softmax(scaled_logits, dim=1)
+            _, predicted = torch.max(scaled_logits, 1)
             
             all_predictions.extend(predicted.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
             all_probabilities.extend(probabilities.cpu().numpy())
     
     return np.array(all_predictions), np.array(all_labels), np.array(all_probabilities)
+
+
+def gather_logits_and_labels(model, data_loader, model_type):
+    """Collect logits and labels for a data loader."""
+    logits_list = []
+    label_list = []
+    model.eval()
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch['input_ids'].to(DEVICE)
+            attention_mask = batch['attention_mask'].to(DEVICE)
+            audio_features = batch['audio_features'].to(DEVICE)
+            labels = batch['label'].to(DEVICE)
+            
+            if model_type == 'lyrics_only':
+                logits = model(input_ids, attention_mask)
+            elif model_type == 'audio_only':
+                logits = model(audio_features)
+            else:
+                logits = model(input_ids, attention_mask, audio_features)
+            
+            logits_list.append(logits)
+            label_list.append(labels)
+    return torch.cat(logits_list, dim=0), torch.cat(label_list, dim=0)
+
+
+def calibrate_temperature(model, val_loader, model_type, max_iters=TEMPERATURE_SCALING_MAX_ITERS):
+    """Fit temperature scaling parameter on validation data."""
+    print("\nApplying temperature scaling...")
+    logits, labels = gather_logits_and_labels(model, val_loader, model_type)
+    temperature = torch.ones(1, device=DEVICE, requires_grad=True)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.LBFGS([temperature], lr=0.01, max_iter=max_iters)
+    
+    def eval_once():
+        optimizer.zero_grad()
+        loss = criterion(logits / temperature, labels)
+        loss.backward()
+        return loss
+    
+    optimizer.step(eval_once)
+    learned_temp = float(temperature.item())
+    print(f"   Learned temperature: {learned_temp:.3f}")
+    return max(1e-3, learned_temp)
 
 
 def plot_confusion_matrix(y_true, y_pred, class_names, model_name):
@@ -156,12 +202,18 @@ def evaluate_model(args):
     print(f"   Classes: {class_names}")
     
     # Load model
-    model = load_model(args.model, num_classes)
+    model = load_model(args.model, num_classes, args.run_name)
+    
+    temperature = 1.0
+    if args.calibrate:
+        temperature = calibrate_temperature(
+            model, data_loaders['val'], args.model, max_iters=args.calibration_iters
+        )
     
     # Get predictions
     print(f"\nGenerating predictions...")
     y_pred, y_true, y_proba = get_predictions(
-        model, data_loaders['test'], args.model
+        model, data_loaders['test'], args.model, temperature=temperature
     )
     
     # Calculate metrics
@@ -196,16 +248,19 @@ def evaluate_model(args):
     # Save detailed results
     results = {
         'model': args.model,
+        'run_name': args.run_name or args.model,
         'accuracy': float(accuracy),
         'precision_macro': float(precision),
         'recall_macro': float(recall),
         'f1_macro': float(f1_macro),
         'f1_weighted': float(f1_weighted),
         'num_classes': num_classes,
-        'class_names': class_names
+        'class_names': class_names,
+        'temperature': temperature
     }
     
-    results_path = f'evaluation_results_{args.model}.json'
+    suffix = args.run_name or args.model
+    results_path = f'evaluation_results_{suffix}.json'
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     
@@ -219,7 +274,12 @@ if __name__ == "__main__":
     parser.add_argument('--model', type=str, required=True,
                         choices=['lyrics_only', 'audio_only', 'multimodal'],
                         help='Model type to evaluate')
+    parser.add_argument('--run_name', type=str, default=None,
+                        help='Optional run/checkpoint identifier')
+    parser.add_argument('--calibrate', action='store_true',
+                        help='Apply temperature scaling using the validation set')
+    parser.add_argument('--calibration_iters', type=int, default=TEMPERATURE_SCALING_MAX_ITERS,
+                        help='Maximum optimizer iterations for calibration')
     
     args = parser.parse_args()
     evaluate_model(args)
-

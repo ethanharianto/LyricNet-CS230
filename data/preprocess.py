@@ -15,11 +15,17 @@ Usage:
 
 import os
 import sys
+import re
+import random
+import html
 from pathlib import Path
+from collections import Counter
+from difflib import get_close_matches
+
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from collections import Counter
+from langdetect import detect_langs, DetectorFactory, LangDetectException
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -28,8 +34,66 @@ from config import (
     RAW_DATA_DIR, PROCESSED_DATA_DIR, 
     TRAIN_SPLIT, VAL_SPLIT, TEST_SPLIT,
     RANDOM_SEED, MIN_SAMPLES_PER_CLASS,
-    AUDIO_FEATURES
+    AUDIO_FEATURES, CLEAN_LYRICS, STANDARDIZE_EMOTIONS,
+    ENABLE_LYRIC_AUGMENTATION, AUGMENTATION_PROBABILITY,
+    MAX_AUGMENTATIONS_PER_SAMPLE, MIN_LYRIC_CHAR_LENGTH,
+    FILTER_NON_ENGLISH_LYRICS, SUPPORTED_LANGUAGES,
+    LANG_DETECTION_MIN_PROB, LANG_DETECTION_SAMPLE_CHARS,
+    STANDARD_EMOTION_VOCAB, ENABLE_FUZZY_EMOTION_MAPPING,
+    FUZZY_MATCH_THRESHOLD, ALLOWED_EMOTIONS
 )
+
+DetectorFactory.seed = RANDOM_SEED
+
+EMOTION_NORMALIZATION_MAP = {
+    'joyful': 'joy',
+    'joyous': 'joy',
+    'happy': 'joy',
+    'happiness': 'joy',
+    'cheerful': 'joy',
+    'delight': 'joy',
+    'sad': 'sadness',
+    'melancholy': 'sadness',
+    'blue': 'sadness',
+    'sorrow': 'sadness',
+    'angry': 'anger',
+    'mad': 'anger',
+    'rage': 'anger',
+    'furious': 'anger',
+    'fearful': 'fear',
+    'scared': 'fear',
+    'afraid': 'fear',
+    'terror': 'fear',
+    'love': 'love',
+    'romantic': 'love',
+    'affection': 'love',
+    'longing': 'love',
+    'surprised': 'surprise',
+    'astonished': 'surprise',
+    'shock': 'surprise',
+    'relaxed': 'calm',
+    'calmness': 'calm',
+    'chill': 'calm',
+    'energetic': 'energy',
+    'energeticness': 'energy',
+    'excited': 'energy',
+    'party': 'energy',
+}
+
+AUGMENTATION_SYNONYM_MAP = {
+    'happy': ['joyful', 'cheerful', 'gleeful', 'bright'],
+    'sad': ['blue', 'melancholy', 'downcast', 'somber'],
+    'love': ['adore', 'cherish', 'treasure', 'embrace'],
+    'angry': ['irate', 'livid', 'mad', 'heated'],
+    'lonely': ['isolated', 'solo', 'abandoned', 'alone'],
+    'night': ['darkness', 'midnight', 'dusk', 'moonlight'],
+    'heart': ['soul', 'spirit', 'core', 'chest'],
+    'fire': ['flame', 'spark', 'ember', 'blaze'],
+    'dream': ['vision', 'fantasy', 'reverie', 'notion'],
+    'dance': ['groove', 'sway', 'swing', 'move'],
+    'cry': ['weep', 'sob', 'wail', 'lament'],
+    'fear': ['dread', 'terror', 'panic', 'unease']
+}
 
 
 def load_raw_data():
@@ -139,26 +203,174 @@ def clean_data(df):
     
     # Clean emotion column - lowercase and strip whitespace
     df[emotion_col] = df[emotion_col].str.lower().str.strip()
+
+    df[emotion_col] = df[emotion_col].apply(standardize_emotion_label)
+    print("   Applied emotion standardization (lexical + fuzzy matching)")
+
+    if CLEAN_LYRICS:
+        print("   Cleaning lyric text (HTML, whitespace, repeated characters)")
+        df[lyric_col] = df[lyric_col].apply(clean_lyric_text)
     
     # Remove very short lyrics (likely incomplete)
-    df = df[df[lyric_col].str.len() > 50]
+    df = df[df[lyric_col].str.len() > MIN_LYRIC_CHAR_LENGTH]
     print(f"   Removed short lyrics, {len(df):,} rows remaining")
+
+    # Drop duplicate lyrics to avoid leakage
+    before_dedup = len(df)
+    df = df.drop_duplicates(subset=[lyric_col])
+    if len(df) != before_dedup:
+        print(f"   Removed {before_dedup - len(df):,} duplicate lyric entries")
+
+    if FILTER_NON_ENGLISH_LYRICS:
+        df, removed_lang, lang_counts = filter_non_english(df, lyric_col)
+        print(f"   Filtered out {removed_lang:,} non-supported language lyrics")
+        if lang_counts:
+            top_langs = lang_counts.most_common(5)
+            print(f"   Language distribution (top 5): {top_langs}")
     
     # Filter out classes with too few samples (this will also remove weird emotion values)
     emotion_counts = df[emotion_col].value_counts()
-    valid_emotions = emotion_counts[emotion_counts >= MIN_SAMPLES_PER_CLASS].index
+
+    if ALLOWED_EMOTIONS:
+        allowed_set = {e.lower() for e in ALLOWED_EMOTIONS}
+        df = df[df[emotion_col].isin(allowed_set)]
+        emotion_counts = df[emotion_col].value_counts()
+        print(f"   Restricted to allowed emotions: {sorted(allowed_set)}")
+
+    valid_emotions = emotion_counts[emotion_counts >= MIN_SAMPLES_PER_CLASS].index.tolist()
     
-    # Also filter to keep only standard emotion labels (optional, for cleaner data)
-    standard_emotions = ['joy', 'sadness', 'anger', 'fear', 'love', 'surprise']
-    valid_emotions = [e for e in valid_emotions if e in standard_emotions]
+    if len(valid_emotions) == 0:
+        # Fall back to top-k classes if nothing meets threshold
+        top_k = min(8, len(emotion_counts))
+        valid_emotions = emotion_counts.index[:top_k].tolist()
+        print(f"   WARNING: No classes met MIN_SAMPLES_PER_CLASS. Keeping top {top_k} classes instead.")
     
     df = df[df[emotion_col].isin(valid_emotions)]
-    print(f"   Kept {len(valid_emotions)} emotion classes with >{MIN_SAMPLES_PER_CLASS} samples")
+    print(f"   Kept {len(valid_emotions)} emotion classes with >= {MIN_SAMPLES_PER_CLASS} samples (or top frequency fallback)")
     print(f"   Classes: {sorted(valid_emotions)}")
+
+    # Optional synonym-based augmentation to inject lexical variety
+    df, augmentations = maybe_augment_lyrics(df, lyric_col, emotion_col)
+    if augmentations:
+        print(f"   Added {augmentations:,} augmented lyric samples")
     
     print(f"\n   Final dataset size: {len(df):,} rows")
     
     return df, lyric_col, emotion_col
+
+
+def clean_lyric_text(text):
+    """Normalize lyric text by stripping HTML, URLs, and noisy chars."""
+    if not isinstance(text, str):
+        return ""
+    text = html.unescape(text)
+    text = re.sub(r"http\S+", " ", text)  # remove urls
+    text = re.sub(r"\[(.*?)\]", " ", text)  # remove bracketed stage directions
+    text = re.sub(r"<.*?>", " ", text)  # remove HTML tags
+    text = re.sub(r"[\r\n]+", " ", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    # reduce repeated characters (e.g., coooool -> coool)
+    text = re.sub(r"(.)\1{3,}", r"\1\1\1", text)
+    text = text.strip()
+    return text
+
+
+def standardize_emotion_label(label):
+    """Map synonyms and similar labels into a canonical vocabulary."""
+    if not isinstance(label, str):
+        return label
+    normalized = label
+    if STANDARDIZE_EMOTIONS:
+        normalized = EMOTION_NORMALIZATION_MAP.get(normalized, normalized)
+    if ENABLE_FUZZY_EMOTION_MAPPING and STANDARD_EMOTION_VOCAB:
+        matches = get_close_matches(normalized, STANDARD_EMOTION_VOCAB, n=1, cutoff=FUZZY_MATCH_THRESHOLD)
+        if matches:
+            normalized = matches[0]
+    return normalized
+
+
+def detect_language_with_confidence(text):
+    """Detect language with langdetect and return lang + probability."""
+    if not isinstance(text, str):
+        return None, 0.0
+    snippet = text.strip()
+    if not snippet:
+        return None, 0.0
+    snippet = snippet[:LANG_DETECTION_SAMPLE_CHARS]
+    try:
+        detections = detect_langs(snippet)
+    except LangDetectException:
+        return None, 0.0
+    if not detections:
+        return None, 0.0
+    best = max(detections, key=lambda d: d.prob)
+    return best.lang, best.prob
+
+
+def filter_non_english(df, lyric_col):
+    """Filter dataset to supported languages using langdetect."""
+    supported = set(code.lower() for code in SUPPORTED_LANGUAGES)
+    df = df.copy()
+    languages = []
+    probs = []
+    for lyric in df[lyric_col]:
+        lang, prob = detect_language_with_confidence(lyric)
+        languages.append(lang)
+        probs.append(prob)
+    df['_detected_lang'] = languages
+    df['_lang_prob'] = probs
+    lang_counts = Counter(lang for lang in languages if lang)
+    keep_mask = (
+        df['_detected_lang'].isin(supported) &
+        (df['_lang_prob'] >= LANG_DETECTION_MIN_PROB)
+    )
+    filtered_df = df[keep_mask].drop(columns=['_detected_lang', '_lang_prob'])
+    removed = len(df) - len(filtered_df)
+    return filtered_df, removed, lang_counts
+
+
+def augment_lyric_text(lyrics):
+    """Replace selected tokens with synonyms to create lightweight augmentations."""
+    tokens = lyrics.split()
+    if not tokens:
+        return lyrics
+    replaced = False
+    for idx, token in enumerate(tokens):
+        stripped = re.sub(r"[^a-zA-Z']", "", token).lower()
+        if stripped in AUGMENTATION_SYNONYM_MAP and random.random() < 0.3:
+            replacement = random.choice(AUGMENTATION_SYNONYM_MAP[stripped])
+            # Preserve simple punctuation around the word
+            prefix = ""
+            suffix = ""
+            lower_token = token.lower()
+            if stripped and stripped in lower_token:
+                start = lower_token.find(stripped)
+                end = start + len(stripped)
+                prefix = token[:start]
+                suffix = token[end:]
+            tokens[idx] = f"{prefix}{replacement}{suffix}"
+            replaced = True
+    return " ".join(tokens) if replaced else lyrics
+
+
+def maybe_augment_lyrics(df, lyric_col, emotion_col):
+    """Optionally augment dataset through synonym replacement."""
+    if not ENABLE_LYRIC_AUGMENTATION:
+        return df, 0
+    augmented_rows = []
+    for _, row in df.iterrows():
+        augmentations = 0
+        while augmentations < MAX_AUGMENTATIONS_PER_SAMPLE and random.random() < AUGMENTATION_PROBABILITY:
+            aug_lyrics = augment_lyric_text(row[lyric_col])
+            if aug_lyrics == row[lyric_col]:
+                break
+            new_row = row.copy()
+            new_row[lyric_col] = aug_lyrics
+            augmented_rows.append(new_row)
+            augmentations += 1
+    if augmented_rows:
+        df = pd.concat([df, pd.DataFrame(augmented_rows)], ignore_index=True)
+    return df, len(augmented_rows)
 
 
 def extract_audio_features(df):
@@ -352,4 +564,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

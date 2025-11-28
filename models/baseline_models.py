@@ -15,8 +15,10 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from config import (
     BERT_MODEL_NAME, BERT_HIDDEN_SIZE, FREEZE_BERT,
-    AUDIO_FEATURE_DIM, FUSION_HIDDEN_DIMS, DROPOUT_RATE
+    AUDIO_FEATURE_DIM, FUSION_HIDDEN_DIMS, DROPOUT_RATE,
+    LYRIC_POOLING_STRATEGIES
 )
+from models.modules import LyricPooling, build_linear
 
 
 class LyricsOnlyModel(nn.Module):
@@ -44,9 +46,12 @@ class LyricsOnlyModel(nn.Module):
             # Enable gradient checkpointing to save memory when training BERT
             self.bert.gradient_checkpointing_enable()
         
+        self.pooling = LyricPooling(BERT_HIDDEN_SIZE, LYRIC_POOLING_STRATEGIES)
+        pooled_dim = self.pooling.output_dim
+        
         # Classification head
         self.dropout = nn.Dropout(DROPOUT_RATE)
-        self.classifier = nn.Linear(BERT_HIDDEN_SIZE, num_classes)
+        self.classifier = build_linear(pooled_dim, num_classes)
     
     def forward(self, input_ids, attention_mask):
         """
@@ -59,18 +64,24 @@ class LyricsOnlyModel(nn.Module):
         Returns:
             logits: Class logits [batch_size, num_classes]
         """
-        # Get BERT output (use [CLS] token representation)
         outputs = self.bert(
             input_ids=input_ids,
-            attention_mask=attention_mask
+            attention_mask=attention_mask,
+            return_dict=True
         )
         
-        # Use [CLS] token embedding (first token)
-        pooled_output = outputs.pooler_output  # [batch_size, 768]
+        cls_embedding = outputs.pooler_output
+        if cls_embedding is None:
+            cls_embedding = outputs.last_hidden_state[:, 0, :]
         
-        # Apply dropout and classify
-        pooled_output = self.dropout(pooled_output)
-        logits = self.classifier(pooled_output)
+        lyrics_embedding = self.pooling(
+            outputs.last_hidden_state,
+            attention_mask,
+            cls_embedding
+        )
+        
+        lyrics_embedding = self.dropout(lyrics_embedding)
+        logits = self.classifier(lyrics_embedding)
         
         return logits
 
@@ -95,13 +106,13 @@ class AudioOnlyModel(nn.Module):
         
         # Build hidden layers
         for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(build_linear(prev_dim, hidden_dim))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(DROPOUT_RATE))
             prev_dim = hidden_dim
         
         # Output layer
-        layers.append(nn.Linear(prev_dim, num_classes))
+        layers.append(build_linear(prev_dim, num_classes))
         
         self.network = nn.Sequential(*layers)
     
@@ -165,4 +176,3 @@ if __name__ == "__main__":
     print(f"   Audio-Only trainable parameters: {audio_params:,}")
     
     print("\nAll baseline models working successfully!")
-

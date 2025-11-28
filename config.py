@@ -28,6 +28,24 @@ RANDOM_SEED = 42
 
 # Minimum samples per class to avoid underrepresented classes
 MIN_SAMPLES_PER_CLASS = 50
+MIN_LYRIC_CHAR_LENGTH = 50  # Filter out extremely short lyric snippets
+
+# Data cleaning / augmentation toggles
+CLEAN_LYRICS = True
+STANDARDIZE_EMOTIONS = True
+ENABLE_LYRIC_AUGMENTATION = True
+AUGMENTATION_PROBABILITY = 0.2  # Chance of creating augmented copy per row
+MAX_AUGMENTATIONS_PER_SAMPLE = 1  # Cap duplicated samples per lyric
+FILTER_NON_ENGLISH_LYRICS = True
+SUPPORTED_LANGUAGES = ("en",)
+LANG_DETECTION_MIN_PROB = 0.70
+LANG_DETECTION_SAMPLE_CHARS = 400
+
+# Emotion vocabulary controls
+STANDARD_EMOTION_VOCAB = ["joy", "sadness", "anger", "fear", "love", "surprise", "calm", "energy"]
+ENABLE_FUZZY_EMOTION_MAPPING = True
+FUZZY_MATCH_THRESHOLD = 0.72
+ALLOWED_EMOTIONS = None  # Optional explicit whitelist (list or None)
 
 # ============================================================================
 # MODEL HYPERPARAMETERS
@@ -46,8 +64,14 @@ AUDIO_FEATURES = [
 AUDIO_FEATURE_DIM = len(AUDIO_FEATURES)
 
 # Fusion architecture
-FUSION_HIDDEN_DIMS = [512, 256]  # Hidden layers after fusion
-DROPOUT_RATE = 0.0
+FUSION_HIDDEN_DIMS = [768, 512, 256]  # Hidden layers after fusion
+FUSION_ATTENTION_LAYERS = 2
+FUSION_ATTENTION_HEADS = 4
+DROPOUT_RATE = 0.1
+LYRIC_POOLING_STRATEGIES = ["cls", "attention"]
+POOLING_ATTENTION_HIDDEN = 256
+USE_MIXOUT = False
+MIXOUT_PROB = 0.1
 
 # ============================================================================
 # TRAINING HYPERPARAMETERS
@@ -55,7 +79,7 @@ DROPOUT_RATE = 0.0
 BATCH_SIZE = 1  # Batch size for training
 LEARNING_RATE = 2e-5  # Standard learning rate for BERT fine-tuning
 NUM_EPOCHS = 5  # Maximum epochs with early stopping
-WEIGHT_DECAY = 0.00
+WEIGHT_DECAY = 0.0
 WARMUP_STEPS = 500
 
 # Device
@@ -68,6 +92,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.ba
 # You'll need to update this after exploring the data
 NUM_EMOTION_CLASSES = None  # To be determined from data
 EMOTION_LABELS = None  # List of emotion label names
+TEMPERATURE_SCALING_MAX_ITERS = 50
 
 # ============================================================================
 # LOGGING & CHECKPOINTING
@@ -89,4 +114,3 @@ elif DEVICE.type == "cuda":
     print(f"Using CUDA GPU: {torch.cuda.get_device_name(0)}")
 else:
     print("Using CPU (training will be slow)")
-

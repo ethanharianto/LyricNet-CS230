@@ -14,8 +14,11 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from config import (
     BERT_MODEL_NAME, BERT_HIDDEN_SIZE, FREEZE_BERT,
-    AUDIO_FEATURE_DIM, FUSION_HIDDEN_DIMS, DROPOUT_RATE
+    AUDIO_FEATURE_DIM, FUSION_HIDDEN_DIMS, DROPOUT_RATE,
+    FUSION_ATTENTION_LAYERS, FUSION_ATTENTION_HEADS,
+    LYRIC_POOLING_STRATEGIES
 )
+from models.modules import LyricPooling, build_linear
 
 
 class MultimodalFusionModel(nn.Module):
@@ -49,9 +52,12 @@ class MultimodalFusionModel(nn.Module):
                 param.requires_grad = False
             print("   BERT weights frozen")
         
-        # Project BERT output for additional flexibility
+        self.pooling = LyricPooling(BERT_HIDDEN_SIZE, LYRIC_POOLING_STRATEGIES)
+        lyric_input_dim = self.pooling.output_dim
+        
+        # Project pooled lyrics into shared embedding space
         self.lyrics_projection = nn.Sequential(
-            nn.Linear(BERT_HIDDEN_SIZE, BERT_HIDDEN_SIZE),
+            build_linear(lyric_input_dim, BERT_HIDDEN_SIZE),
             nn.ReLU(),
             nn.Dropout(DROPOUT_RATE)
         )
@@ -61,17 +67,35 @@ class MultimodalFusionModel(nn.Module):
         # ====================================================================
         # Project audio features to same dimension as BERT
         self.audio_encoder = nn.Sequential(
-            nn.Linear(AUDIO_FEATURE_DIM, 256),
+            build_linear(AUDIO_FEATURE_DIM, 256),
             nn.ReLU(),
             nn.Dropout(DROPOUT_RATE),
-            nn.Linear(256, 512),
+            build_linear(256, 512),
             nn.ReLU(),
             nn.Dropout(DROPOUT_RATE),
-            nn.Linear(512, BERT_HIDDEN_SIZE),  # Project to match BERT dimension
+            build_linear(512, BERT_HIDDEN_SIZE),  # Project to match BERT dimension
             nn.ReLU(),
             nn.Dropout(DROPOUT_RATE)
         )
         
+        # ====================================================================
+        # Cross-modal attention (optional)
+        # ====================================================================
+        self.use_attention = FUSION_ATTENTION_LAYERS > 0
+        self.attention_layers = nn.ModuleList()
+        self.attention_norms = nn.ModuleList()
+        if self.use_attention:
+            for _ in range(FUSION_ATTENTION_LAYERS):
+                self.attention_layers.append(
+                    nn.MultiheadAttention(
+                        embed_dim=BERT_HIDDEN_SIZE,
+                        num_heads=FUSION_ATTENTION_HEADS,
+                        dropout=DROPOUT_RATE,
+                        batch_first=True
+                    )
+                )
+                self.attention_norms.append(nn.LayerNorm(BERT_HIDDEN_SIZE))
+
         # ====================================================================
         # Fusion Network
         # ====================================================================
@@ -82,13 +106,13 @@ class MultimodalFusionModel(nn.Module):
         prev_dim = fusion_input_dim
         
         for hidden_dim in FUSION_HIDDEN_DIMS:
-            fusion_layers.append(nn.Linear(prev_dim, hidden_dim))
+            fusion_layers.append(build_linear(prev_dim, hidden_dim))
             fusion_layers.append(nn.ReLU())
             fusion_layers.append(nn.Dropout(DROPOUT_RATE))
             prev_dim = hidden_dim
         
         # Final classification layer
-        fusion_layers.append(nn.Linear(prev_dim, num_classes))
+        fusion_layers.append(build_linear(prev_dim, num_classes))
         
         self.fusion_network = nn.Sequential(*fusion_layers)
     
@@ -109,9 +133,18 @@ class MultimodalFusionModel(nn.Module):
         # ====================================================================
         bert_outputs = self.bert(
             input_ids=input_ids,
-            attention_mask=attention_mask
+            attention_mask=attention_mask,
+            return_dict=True
         )
-        lyrics_embedding = bert_outputs.pooler_output  # [batch_size, 768]
+        cls_embedding = bert_outputs.pooler_output
+        if cls_embedding is None:
+            cls_embedding = bert_outputs.last_hidden_state[:, 0, :]
+        lyrics_tokens = bert_outputs.last_hidden_state
+        lyrics_embedding = self.pooling(
+            lyrics_tokens,
+            attention_mask,
+            cls_embedding
+        )
         lyrics_embedding = self.lyrics_projection(lyrics_embedding)
         
         # ====================================================================
@@ -122,8 +155,14 @@ class MultimodalFusionModel(nn.Module):
         # ====================================================================
         # Fusion
         # ====================================================================
-        # Concatenate both modalities
-        fused = torch.cat([lyrics_embedding, audio_embedding], dim=1)  # [batch_size, 1536]
+        if self.use_attention:
+            stacked = torch.stack([lyrics_embedding, audio_embedding], dim=1)  # [batch, 2, 768]
+            for attn, norm in zip(self.attention_layers, self.attention_norms):
+                attn_output, _ = attn(stacked, stacked, stacked)
+                stacked = norm(stacked + attn_output)
+            fused = stacked.reshape(stacked.size(0), -1)
+        else:
+            fused = torch.cat([lyrics_embedding, audio_embedding], dim=1)  # [batch_size, 1536]
         
         # Pass through fusion network
         logits = self.fusion_network(fused)  # [batch_size, num_classes]
@@ -139,15 +178,28 @@ class MultimodalFusionModel(nn.Module):
             embeddings: Fused embeddings [batch_size, last_hidden_dim]
         """
         # Get lyrics embedding
-        bert_outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        lyrics_embedding = bert_outputs.pooler_output
+        bert_outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        cls_embedding = bert_outputs.pooler_output
+        if cls_embedding is None:
+            cls_embedding = bert_outputs.last_hidden_state[:, 0, :]
+        lyrics_embedding = self.pooling(
+            bert_outputs.last_hidden_state,
+            attention_mask,
+            cls_embedding
+        )
         lyrics_embedding = self.lyrics_projection(lyrics_embedding)
         
         # Get audio embedding
         audio_embedding = self.audio_encoder(audio_features)
         
-        # Concatenate embeddings
-        fused = torch.cat([lyrics_embedding, audio_embedding], dim=1)
+        if self.use_attention:
+            stacked = torch.stack([lyrics_embedding, audio_embedding], dim=1)
+            for attn, norm in zip(self.attention_layers, self.attention_norms):
+                attn_output, _ = attn(stacked, stacked, stacked)
+                stacked = norm(stacked + attn_output)
+            fused = stacked.reshape(stacked.size(0), -1)
+        else:
+            fused = torch.cat([lyrics_embedding, audio_embedding], dim=1)
         
         # Pass through fusion layers, excluding final classification layer
         for i, layer in enumerate(self.fusion_network[:-1]):
@@ -200,4 +252,3 @@ if __name__ == "__main__":
     print(f"   Frozen parameters: {total_params - trainable_params:,}")
     
     print("\nMultimodal model working successfully!")
-

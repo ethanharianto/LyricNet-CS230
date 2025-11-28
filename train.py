@@ -14,9 +14,11 @@ Usage:
 """
 
 import argparse
+import copy
 import os
 import json
 import time
+from itertools import product
 from tqdm import tqdm
 import torch
 import torch.nn as nn
@@ -132,8 +134,21 @@ def evaluate(model, data_loader, criterion, device, model_type):
     return avg_loss, accuracy, all_predictions, all_labels
 
 
+def parse_sweep_values(value_str, cast_type):
+    if not value_str:
+        return []
+    values = []
+    for raw in value_str.split(','):
+        raw = raw.strip()
+        if not raw:
+            continue
+        values.append(cast_type(raw))
+    return values
+
+
 def train(args):
     """Main training function."""
+    run_name = args.run_name or args.model
     print("=" * 70)
     print(f"Training {args.model.upper()} model")
     print("=" * 70)
@@ -141,6 +156,8 @@ def train(args):
     print(f"Epochs: {args.epochs}")
     print(f"Batch size: {args.batch_size}")
     print(f"Learning rate: {args.lr}")
+    print(f"Weight decay: {args.weight_decay}")
+    print(f"Run name: {run_name}")
     print("=" * 70)
     
     # Load data
@@ -176,7 +193,7 @@ def train(args):
     optimizer = optim.AdamW(
         model.parameters(),
         lr=args.lr,
-        weight_decay=WEIGHT_DECAY
+        weight_decay=args.weight_decay
     )
     
     # Learning rate scheduler
@@ -185,12 +202,13 @@ def train(args):
     )
     
     # Tensorboard
-    writer = SummaryWriter(os.path.join(LOG_DIR, args.model))
+    writer = SummaryWriter(os.path.join(LOG_DIR, run_name))
     
     # Training loop
     print(f"\nStarting training...\n")
     best_val_acc = 0.0
     patience_counter = 0
+    best_model_path = None
     
     for epoch in range(args.epochs):
         print(f"\n{'='*70}")
@@ -229,15 +247,15 @@ def train(args):
             
             if SAVE_BEST_MODEL:
                 os.makedirs(MODEL_DIR, exist_ok=True)
-                model_path = os.path.join(MODEL_DIR, f'{args.model}_best.pth')
+                best_model_path = os.path.join(MODEL_DIR, f'{run_name}_best.pth')
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'val_acc': val_acc,
                     'val_loss': val_loss,
-                }, model_path)
-                print(f"   Saved best model to {model_path}")
+                }, best_model_path)
+                print(f"   Saved best model to {best_model_path}")
         else:
             patience_counter += 1
         
@@ -252,8 +270,8 @@ def train(args):
     print(f"{'='*70}")
     
     # Load best model
-    if SAVE_BEST_MODEL:
-        checkpoint = torch.load(os.path.join(MODEL_DIR, f'{args.model}_best.pth'))
+    if SAVE_BEST_MODEL and best_model_path and os.path.exists(best_model_path):
+        checkpoint = torch.load(best_model_path)
         model.load_state_dict(checkpoint['model_state_dict'])
     
     test_loss, test_acc, test_preds, test_labels = evaluate(
@@ -267,15 +285,17 @@ def train(args):
     # Save results
     results = {
         'model': args.model,
+        'run_name': run_name,
         'test_loss': test_loss,
         'test_accuracy': test_acc,
         'best_val_accuracy': best_val_acc,
         'num_classes': num_classes,
         'total_params': total_params,
-        'trainable_params': trainable_params
+        'trainable_params': trainable_params,
+        'best_model_path': best_model_path
     }
     
-    results_path = os.path.join(MODEL_DIR, f'{args.model}_results.json')
+    results_path = os.path.join(MODEL_DIR, f'{run_name}_results.json')
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     
@@ -283,6 +303,51 @@ def train(args):
     print(f"\nTraining complete!")
     
     writer.close()
+    
+    return results
+
+
+def run_sweep(args):
+    """Run simple grid search over provided hyperparameters."""
+    lr_values = parse_sweep_values(args.sweep_lrs, float) or [args.lr]
+    batch_values = parse_sweep_values(args.sweep_batch_sizes, int) or [args.batch_size]
+    wd_values = parse_sweep_values(args.sweep_weight_decays, float) or [args.weight_decay]
+    
+    best_score = -float('inf')
+    best_config = None
+    summary = []
+    
+    for lr, batch, wd in product(lr_values, batch_values, wd_values):
+        sweep_args = copy.deepcopy(args)
+        sweep_args.lr = lr
+        sweep_args.batch_size = batch
+        sweep_args.weight_decay = wd
+        
+        base_name = args.run_name or args.model
+        lr_tag = str(lr).replace('.', 'p')
+        sweep_args.run_name = f"{base_name}_bs{batch}_lr{lr_tag}_wd{wd}"
+        
+        print("\n" + "=" * 70)
+        print(f"SWEEP RUN: lr={lr}, batch={batch}, weight_decay={wd}")
+        print("=" * 70)
+        
+        result = train(sweep_args)
+        val_acc = result['best_val_accuracy']
+        summary.append((lr, batch, wd, val_acc, result['run_name']))
+        
+        if val_acc > best_score:
+            best_score = val_acc
+            best_config = (lr, batch, wd, result['run_name'])
+    
+    print("\nSweep summary:")
+    for lr, batch, wd, acc, run_name in summary:
+        print(f"  Run {run_name}: lr={lr}, batch={batch}, weight_decay={wd} -> Val Acc {acc:.2f}%")
+    
+    if best_config:
+        lr, batch, wd, run_name = best_config
+        print(f"\nBest config: lr={lr}, batch={batch}, weight_decay={wd}, run={run_name}, val_acc={best_score:.2f}%")
+    else:
+        print("\nNo sweep runs executed.")
 
 
 if __name__ == "__main__":
@@ -299,9 +364,22 @@ if __name__ == "__main__":
                         help='Learning rate')
     parser.add_argument('--freeze_bert', action='store_true',
                         help='Freeze BERT weights (faster training)')
+    parser.add_argument('--weight_decay', type=float, default=WEIGHT_DECAY,
+                        help='Weight decay for optimizer')
+    parser.add_argument('--run_name', type=str, default=None,
+                        help='Optional run name for checkpoints/logs')
+    parser.add_argument('--sweep', action='store_true',
+                        help='Enable grid search over hyperparameters')
+    parser.add_argument('--sweep_lrs', type=str, default=None,
+                        help='Comma separated learning rates for sweep')
+    parser.add_argument('--sweep_batch_sizes', type=str, default=None,
+                        help='Comma separated batch sizes for sweep')
+    parser.add_argument('--sweep_weight_decays', type=str, default=None,
+                        help='Comma separated weight decays for sweep')
     
     args = parser.parse_args()
     
-    # Train model
-    train(args)
-
+    if args.sweep:
+        run_sweep(args)
+    else:
+        train(args)
