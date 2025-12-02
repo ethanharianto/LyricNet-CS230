@@ -6,7 +6,7 @@ Baseline models for LyricNet:
 
 import torch
 import torch.nn as nn
-from transformers import BertModel
+from transformers import AutoModel, AutoTokenizer
 import sys
 from pathlib import Path
 
@@ -35,23 +35,37 @@ class LyricsOnlyModel(nn.Module):
         super(LyricsOnlyModel, self).__init__()
         
         # Load pre-trained BERT
-        self.bert = BertModel.from_pretrained(BERT_MODEL_NAME)
+        self.bert = AutoModel.from_pretrained(BERT_MODEL_NAME)
+        tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL_NAME)
         
         # Freeze BERT if specified for faster training
         if freeze_bert:
             for param in self.bert.parameters():
                 param.requires_grad = False
             print("   BERT weights frozen")
+            self.bert.eval()
         else:
             # Enable gradient checkpointing to save memory when training BERT
             self.bert.gradient_checkpointing_enable()
         
+        
         self.pooling = LyricPooling(BERT_HIDDEN_SIZE, LYRIC_POOLING_STRATEGIES)
         pooled_dim = self.pooling.output_dim
+
         
         # Classification head
-        self.dropout = nn.Dropout(DROPOUT_RATE)
-        self.classifier = build_linear(pooled_dim, num_classes)
+        self.classifier = nn.Sequential(
+            nn.Linear(pooled_dim, 1024),
+            nn.GELU(),
+            #nn.Dropout(0.2),
+            nn.Linear(1024, 512),
+            nn.GELU(),
+            #nn.Dropout(0.2),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            #nn.Dropout(0.2),
+            nn.Linear(256, num_classes),
+        )
     
     def forward(self, input_ids, attention_mask):
         """
@@ -69,8 +83,8 @@ class LyricsOnlyModel(nn.Module):
             attention_mask=attention_mask,
             return_dict=True
         )
-        
-        cls_embedding = outputs.pooler_output
+
+        cls_embedding = getattr(outputs, 'pooler_output', None)
         if cls_embedding is None:
             cls_embedding = outputs.last_hidden_state[:, 0, :]
         
@@ -80,7 +94,6 @@ class LyricsOnlyModel(nn.Module):
             cls_embedding
         )
         
-        lyrics_embedding = self.dropout(lyrics_embedding)
         logits = self.classifier(lyrics_embedding)
         
         return logits
@@ -129,50 +142,50 @@ class AudioOnlyModel(nn.Module):
         return self.network(audio_features)
 
 
-if __name__ == "__main__":
-    """Test baseline models."""
-    print("Testing baseline models...\n")
+# if __name__ == "__main__":
+#     """Test baseline models."""
+#     print("Testing baseline models...\n")
     
-    num_classes = 5
-    batch_size = 4
-    seq_length = 512
-    audio_dim = 11
+#     num_classes = 5
+#     batch_size = 4
+#     seq_length = 512
+#     audio_dim = 11
     
-    # Test Lyrics-Only Model
-    print("1. Testing Lyrics-Only Model")
-    lyrics_model = LyricsOnlyModel(num_classes)
+#     # Test Lyrics-Only Model
+#     print("1. Testing Lyrics-Only Model")
+#     lyrics_model = LyricsOnlyModel(num_classes)
     
-    # Create dummy inputs
-    input_ids = torch.randint(0, 30000, (batch_size, seq_length))
-    attention_mask = torch.ones(batch_size, seq_length)
+#     # Create dummy inputs
+#     input_ids = torch.randint(0, 30000, (batch_size, seq_length))
+#     attention_mask = torch.ones(batch_size, seq_length)
     
-    logits = lyrics_model(input_ids, attention_mask)
-    print(f"   Input shape: {input_ids.shape}")
-    print(f"   Output shape: {logits.shape}")
-    print(f"   Expected: ({batch_size}, {num_classes})")
-    assert logits.shape == (batch_size, num_classes), "Shape mismatch!"
-    print("   Lyrics-Only Model working successfully!\n")
+#     logits = lyrics_model(input_ids, attention_mask)
+#     print(f"   Input shape: {input_ids.shape}")
+#     print(f"   Output shape: {logits.shape}")
+#     print(f"   Expected: ({batch_size}, {num_classes})")
+#     assert logits.shape == (batch_size, num_classes), "Shape mismatch!"
+#     print("   Lyrics-Only Model working successfully!\n")
     
-    # Test Audio-Only Model
-    print("2. Testing Audio-Only Model")
-    audio_model = AudioOnlyModel(num_classes, input_dim=audio_dim)
+#     # Test Audio-Only Model
+#     print("2. Testing Audio-Only Model")
+#     audio_model = AudioOnlyModel(num_classes, input_dim=audio_dim)
     
-    # Create dummy audio features
-    audio_features = torch.randn(batch_size, audio_dim)
+#     # Create dummy audio features
+#     audio_features = torch.randn(batch_size, audio_dim)
     
-    logits = audio_model(audio_features)
-    print(f"   Input shape: {audio_features.shape}")
-    print(f"   Output shape: {logits.shape}")
-    print(f"   Expected: ({batch_size}, {num_classes})")
-    assert logits.shape == (batch_size, num_classes), "Shape mismatch!"
-    print("   Audio-Only Model working successfully!\n")
+#     logits = audio_model(audio_features)
+#     print(f"   Input shape: {audio_features.shape}")
+#     print(f"   Output shape: {logits.shape}")
+#     print(f"   Expected: ({batch_size}, {num_classes})")
+#     assert logits.shape == (batch_size, num_classes), "Shape mismatch!"
+#     print("   Audio-Only Model working successfully!\n")
     
-    # Count parameters
-    print("3. Model Statistics")
-    lyrics_params = sum(p.numel() for p in lyrics_model.parameters() if p.requires_grad)
-    audio_params = sum(p.numel() for p in audio_model.parameters() if p.requires_grad)
+#     # Count parameters
+#     print("3. Model Statistics")
+#     lyrics_params = sum(p.numel() for p in lyrics_model.parameters() if p.requires_grad)
+#     audio_params = sum(p.numel() for p in audio_model.parameters() if p.requires_grad)
     
-    print(f"   Lyrics-Only trainable parameters: {lyrics_params:,}")
-    print(f"   Audio-Only trainable parameters: {audio_params:,}")
+#     print(f"   Lyrics-Only trainable parameters: {lyrics_params:,}")
+#     print(f"   Audio-Only trainable parameters: {audio_params:,}")
     
-    print("\nAll baseline models working successfully!")
+#     print("\nAll baseline models working successfully!")

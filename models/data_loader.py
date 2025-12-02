@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-from transformers import BertTokenizer
+from transformers import AutoTokenizer
 import sys
 from pathlib import Path
 
@@ -35,10 +35,8 @@ class LyricDataset(Dataset):
         self.split = split
         
         # Load tokenizer
-        if tokenizer is None:
-            self.tokenizer = BertTokenizer.from_pretrained(BERT_MODEL_NAME)
-        else:
-            self.tokenizer = tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL_NAME)
+
         
         # Load data
         csv_path = os.path.join(PROCESSED_DATA_DIR, f'{split}.csv')
@@ -54,6 +52,23 @@ class LyricDataset(Dataset):
         self.audio_features = np.load(audio_path)
         
         print(f"Loaded {split} set: {len(self.data)} samples")
+        
+        # Compute class weights for balancing
+        if split == 'train':
+            self._compute_weights()
+    
+    def _compute_weights(self):
+        """Compute sample weights for weighted random sampling."""
+        labels = self.data['labels'].values
+        class_counts = np.bincount(labels)
+        total_samples = len(labels)
+        
+        # Weight = 1 / class_frequency
+        class_weights = 1.0 / class_counts
+        
+        # Assign weight to each sample based on its label
+        self.sample_weights = torch.from_numpy(class_weights[labels]).float()
+        print(f"Computed sample weights for {len(self.sample_weights)} samples")
     
     def __len__(self):
         return len(self.data)
@@ -90,8 +105,8 @@ class LyricDataset(Dataset):
         label = torch.LongTensor([row['labels']])[0]
         
         return {
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0),
             'audio_features': audio,
             'label': label
         }
@@ -109,7 +124,7 @@ def get_data_loaders(batch_size=BATCH_SIZE, num_workers=0):
         Dictionary with 'train', 'val', 'test' DataLoaders and 'tokenizer'
     """
     # Create tokenizer (shared across all splits)
-    tokenizer = BertTokenizer.from_pretrained(BERT_MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL_NAME)
     
     # Create datasets
     train_dataset = LyricDataset('train', tokenizer)
@@ -117,10 +132,17 @@ def get_data_loaders(batch_size=BATCH_SIZE, num_workers=0):
     test_dataset = LyricDataset('test', tokenizer)
     
     # Create data loaders
+    # Use WeightedRandomSampler for training to handle class imbalance
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights=train_dataset.sample_weights,
+        num_samples=len(train_dataset),
+        replacement=True
+    )
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        sampler=sampler,  # mutually exclusive with shuffle
         num_workers=num_workers
     )
     
@@ -177,6 +199,15 @@ if __name__ == "__main__":
     
     # Test train loader
     print("\nTesting train loader...")
+    
+    # Check balance of a larger batch
+    balanced_loader = get_data_loaders(batch_size=100)['train']
+    batch = next(iter(balanced_loader))
+    labels = batch['label']
+    
+    print(f"  Batch size: {len(labels)}")
+    print(f"  Label counts in batch: {torch.bincount(labels)}")
+    
     batch = next(iter(loaders['train']))
     
     print(f"  Input IDs shape: {batch['input_ids'].shape}")

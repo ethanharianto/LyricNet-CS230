@@ -5,7 +5,7 @@ Combines lyrics (BERT) and audio features.
 
 import torch
 import torch.nn as nn
-from transformers import BertModel
+from transformers import AutoModel
 import sys
 from pathlib import Path
 
@@ -45,7 +45,7 @@ class MultimodalFusionModel(nn.Module):
         # ====================================================================
         # Lyrics Branch (BERT)
         # ====================================================================
-        self.bert = BertModel.from_pretrained(BERT_MODEL_NAME)
+        self.bert = AutoModel.from_pretrained(BERT_MODEL_NAME)
         
         if freeze_bert:
             for param in self.bert.parameters():
@@ -67,13 +67,13 @@ class MultimodalFusionModel(nn.Module):
         # ====================================================================
         # Project audio features to same dimension as BERT
         self.audio_encoder = nn.Sequential(
-            build_linear(AUDIO_FEATURE_DIM, 256),
+            build_linear(AUDIO_FEATURE_DIM, 64),
             nn.ReLU(),
             nn.Dropout(DROPOUT_RATE),
-            build_linear(256, 512),
+            build_linear(64, 128),
             nn.ReLU(),
             nn.Dropout(DROPOUT_RATE),
-            build_linear(512, BERT_HIDDEN_SIZE),  # Project to match BERT dimension
+            build_linear(128, BERT_HIDDEN_SIZE),  # Project to match BERT dimension
             nn.ReLU(),
             nn.Dropout(DROPOUT_RATE)
         )
@@ -136,7 +136,7 @@ class MultimodalFusionModel(nn.Module):
             attention_mask=attention_mask,
             return_dict=True
         )
-        cls_embedding = bert_outputs.pooler_output
+        cls_embedding = getattr(bert_outputs, 'pooler_output', None)
         if cls_embedding is None:
             cls_embedding = bert_outputs.last_hidden_state[:, 0, :]
         lyrics_tokens = bert_outputs.last_hidden_state
@@ -179,7 +179,7 @@ class MultimodalFusionModel(nn.Module):
         """
         # Get lyrics embedding
         bert_outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-        cls_embedding = bert_outputs.pooler_output
+        cls_embedding = getattr(bert_outputs, 'pooler_output', None)
         if cls_embedding is None:
             cls_embedding = bert_outputs.last_hidden_state[:, 0, :]
         lyrics_embedding = self.pooling(

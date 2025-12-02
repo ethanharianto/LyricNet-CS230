@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
+from sklearn.metrics import balanced_accuracy_score, f1_score
 
 # Import models
 from models.baseline_models import LyricsOnlyModel, AudioOnlyModel
@@ -40,9 +41,13 @@ from config import (
 def train_epoch(model, train_loader, criterion, optimizer, device, model_type):
     """Train model for one epoch."""
     model.train()
+    model.bert.eval()
     total_loss = 0
     correct = 0
     total = 0
+    
+    all_preds = []
+    all_labels = []
     
     progress_bar = tqdm(train_loader, desc='Training')
     
@@ -64,18 +69,26 @@ def train_epoch(model, train_loader, criterion, optimizer, device, model_type):
         elif model_type == 'multimodal':
             logits = model(input_ids, attention_mask, audio_features)
         
+        # print(torch.exp(logits))
+        # print(labels)
         # Compute loss
+        # Note: CrossEntropyLoss expects raw logits (not probabilities)
         loss = criterion(logits, labels)
-        
+    
         # Backward pass
         loss.backward()
         optimizer.step()
         
         # Statistics
         total_loss += loss.item()
+        # Apply softmax to get probabilities for potential other metrics, 
+        # but for accuracy we can just take max of logits
         _, predicted = torch.max(logits, 1)
         total += labels.size(0)
         correct += (predicted == labels).sum().item()
+        
+        all_preds.extend(predicted.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
         
         # Update progress bar
         progress_bar.set_postfix({
@@ -85,8 +98,10 @@ def train_epoch(model, train_loader, criterion, optimizer, device, model_type):
     
     avg_loss = total_loss / len(train_loader)
     accuracy = 100. * correct / total
+    balanced_acc = 100. * balanced_accuracy_score(all_labels, all_preds)
+    f1 = 100. * f1_score(all_labels, all_preds, average='macro')
     
-    return avg_loss, accuracy
+    return avg_loss, accuracy, balanced_acc, f1
 
 
 def evaluate(model, data_loader, criterion, device, model_type):
@@ -130,8 +145,10 @@ def evaluate(model, data_loader, criterion, device, model_type):
     
     avg_loss = total_loss / len(data_loader)
     accuracy = 100. * correct / total
+    balanced_acc = 100. * balanced_accuracy_score(all_labels, all_predictions)
+    f1 = 100. * f1_score(all_labels, all_predictions, average='macro')
     
-    return avg_loss, accuracy, all_predictions, all_labels
+    return avg_loss, accuracy, balanced_acc, f1, all_predictions, all_labels
 
 
 def parse_sweep_values(value_str, cast_type):
@@ -181,6 +198,10 @@ def train(args):
     else:
         raise ValueError(f"Unknown model type: {args.model}")
     
+    # Clear cache before moving model to GPU
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
     model = model.to(DEVICE)
     
     # Count parameters
@@ -190,6 +211,7 @@ def train(args):
     
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
+    
     optimizer = optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -216,12 +238,12 @@ def train(args):
         print(f"{'='*70}")
         
         # Train
-        train_loss, train_acc = train_epoch(
+        train_loss, train_acc, train_bal_acc, train_f1 = train_epoch(
             model, data_loaders['train'], criterion, optimizer, DEVICE, args.model
         )
         
         # Validate
-        val_loss, val_acc, _, _ = evaluate(
+        val_loss, val_acc, val_bal_acc, val_f1, _, _ = evaluate(
             model, data_loaders['val'], criterion, DEVICE, args.model
         )
         
@@ -233,16 +255,28 @@ def train(args):
         writer.add_scalar('Loss/val', val_loss, epoch)
         writer.add_scalar('Accuracy/train', train_acc, epoch)
         writer.add_scalar('Accuracy/val', val_acc, epoch)
+        writer.add_scalar('Balanced_Accuracy/train', train_bal_acc, epoch)
+        writer.add_scalar('Balanced_Accuracy/val', val_bal_acc, epoch)
+        writer.add_scalar('F1/train', train_f1, epoch)
+        writer.add_scalar('F1/val', val_f1, epoch)
         writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], epoch)
         
         # Print results
         print(f"\nEpoch {epoch+1} Results:")
-        print(f"   Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-        print(f"   Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}%")
+        print(f"   Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}% | Bal Acc: {train_bal_acc:.2f}% | F1: {train_f1:.2f}")
+        print(f"   Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}% | Bal Acc: {val_bal_acc:.2f}% | F1: {val_f1:.2f}")
         
-        # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # Save best model using balanced accuracy or f1 can be better for imbalanced datasets
+        # But sticking to val_acc for now as per request or switching to f1?
+        # The plan says "Ensure the model achieves >40% Balanced Accuracy", let's use Bal Acc for saving best model?
+        # The code currently uses val_acc. I will stick to val_acc for consistency but log others.
+        # Actually, for imbalanced datasets, saving best model based on F1 or Bal Acc is better.
+        # Let's switch to Balanced Accuracy for model selection.
+        
+        current_score = val_bal_acc
+        
+        if current_score > best_val_acc:
+            best_val_acc = current_score
             patience_counter = 0
             
             if SAVE_BEST_MODEL:
@@ -253,9 +287,11 @@ def train(args):
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'val_acc': val_acc,
+                    'val_bal_acc': val_bal_acc,
+                    'val_f1': val_f1,
                     'val_loss': val_loss,
                 }, best_model_path)
-                print(f"   Saved best model to {best_model_path}")
+                print(f"   Saved best model to {best_model_path} (Bal Acc: {val_bal_acc:.2f}%)")
         else:
             patience_counter += 1
         
@@ -274,13 +310,15 @@ def train(args):
         checkpoint = torch.load(best_model_path)
         model.load_state_dict(checkpoint['model_state_dict'])
     
-    test_loss, test_acc, test_preds, test_labels = evaluate(
+    test_loss, test_acc, test_bal_acc, test_f1, test_preds, test_labels = evaluate(
         model, data_loaders['test'], criterion, DEVICE, args.model
     )
     
     print(f"\nTest Results:")
     print(f"   Test Loss: {test_loss:.4f}")
     print(f"   Test Accuracy: {test_acc:.2f}%")
+    print(f"   Test Bal Acc: {test_bal_acc:.2f}%")
+    print(f"   Test F1 Score: {test_f1:.2f}")
     
     # Save results
     results = {
@@ -288,7 +326,9 @@ def train(args):
         'run_name': run_name,
         'test_loss': test_loss,
         'test_accuracy': test_acc,
-        'best_val_accuracy': best_val_acc,
+        'test_balanced_accuracy': test_bal_acc,
+        'test_f1': test_f1,
+        'best_val_balanced_accuracy': best_val_acc,
         'num_classes': num_classes,
         'total_params': total_params,
         'trainable_params': trainable_params,

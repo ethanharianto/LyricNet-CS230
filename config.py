@@ -76,9 +76,9 @@ MIXOUT_PROB = 0.1
 # ============================================================================
 # TRAINING HYPERPARAMETERS
 # ============================================================================
-BATCH_SIZE = 1  # Batch size for training
+BATCH_SIZE = 32  # Batch size for training
 LEARNING_RATE = 2e-5  # Standard learning rate for BERT fine-tuning
-NUM_EPOCHS = 5  # Maximum epochs with early stopping
+NUM_EPOCHS = 10  # Maximum epochs with early stopping
 WEIGHT_DECAY = 0.0
 WARMUP_STEPS = 500
 
