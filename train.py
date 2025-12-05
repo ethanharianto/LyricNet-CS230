@@ -1,16 +1,9 @@
 """
-Training script for LyricNet models
+Training script for LyricNet models.
 
 Usage:
-    # Train baseline models
     python train.py --model lyrics_only
-    python train.py --model audio_only
-    
-    # Train multimodal model
-    python train.py --model multimodal
-    
-    # With custom parameters
-    python train.py --model multimodal --epochs 5 --batch_size 32 --lr 1e-5
+    python train.py --model multimodal --epochs 5
 """
 
 import argparse
@@ -24,9 +17,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import balanced_accuracy_score, f1_score
+from sklearn.metrics import balanced_accuracy_score, f1_score, confusion_matrix
 
-# Import models
 from models.baseline_models import LyricsOnlyModel, AudioOnlyModel
 from models.multimodal_model import MultimodalFusionModel
 from models.data_loader import get_data_loaders, load_label_mappings
@@ -34,12 +26,12 @@ from models.data_loader import get_data_loaders, load_label_mappings
 from config import (
     DEVICE, NUM_EPOCHS, BATCH_SIZE, LEARNING_RATE,
     WEIGHT_DECAY, MODEL_DIR, LOG_DIR,
-    SAVE_BEST_MODEL, EARLY_STOPPING_PATIENCE
+    SAVE_BEST_MODEL, EARLY_STOPPING_PATIENCE,
+    USE_WEIGHTED_LOSS, LABEL_SMOOTHING
 )
 
 
 def train_epoch(model, train_loader, criterion, optimizer, device, model_type):
-    """Train model for one epoch."""
     model.train()
     model.bert.eval()
     total_loss = 0
@@ -52,16 +44,13 @@ def train_epoch(model, train_loader, criterion, optimizer, device, model_type):
     progress_bar = tqdm(train_loader, desc='Training')
     
     for batch in progress_bar:
-        # Move data to device
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         audio_features = batch['audio_features'].to(device)
         labels = batch['label'].to(device)
         
-        # Zero gradients
         optimizer.zero_grad()
         
-        # Forward pass
         if model_type == 'lyrics_only':
             logits = model(input_ids, attention_mask)
         elif model_type == 'audio_only':
@@ -69,20 +58,12 @@ def train_epoch(model, train_loader, criterion, optimizer, device, model_type):
         elif model_type == 'multimodal':
             logits = model(input_ids, attention_mask, audio_features)
         
-        # print(torch.exp(logits))
-        # print(labels)
-        # Compute loss
-        # Note: CrossEntropyLoss expects raw logits (not probabilities)
         loss = criterion(logits, labels)
     
-        # Backward pass
         loss.backward()
         optimizer.step()
         
-        # Statistics
         total_loss += loss.item()
-        # Apply softmax to get probabilities for potential other metrics, 
-        # but for accuracy we can just take max of logits
         _, predicted = torch.max(logits, 1)
         total += labels.size(0)
         correct += (predicted == labels).sum().item()
@@ -90,7 +71,6 @@ def train_epoch(model, train_loader, criterion, optimizer, device, model_type):
         all_preds.extend(predicted.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
         
-        # Update progress bar
         progress_bar.set_postfix({
             'loss': f'{loss.item():.4f}',
             'acc': f'{100.*correct/total:.2f}%'
@@ -105,7 +85,6 @@ def train_epoch(model, train_loader, criterion, optimizer, device, model_type):
 
 
 def evaluate(model, data_loader, criterion, device, model_type):
-    """Evaluate model on given dataset."""
     model.eval()
     total_loss = 0
     correct = 0
@@ -116,13 +95,11 @@ def evaluate(model, data_loader, criterion, device, model_type):
     
     with torch.no_grad():
         for batch in tqdm(data_loader, desc='Evaluating'):
-            # Move data to device
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             audio_features = batch['audio_features'].to(device)
             labels = batch['label'].to(device)
             
-            # Forward pass
             if model_type == 'lyrics_only':
                 logits = model(input_ids, attention_mask)
             elif model_type == 'audio_only':
@@ -130,16 +107,13 @@ def evaluate(model, data_loader, criterion, device, model_type):
             elif model_type == 'multimodal':
                 logits = model(input_ids, attention_mask, audio_features)
             
-            # Compute loss
             loss = criterion(logits, labels)
             
-            # Statistics
             total_loss += loss.item()
             _, predicted = torch.max(logits, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
             
-            # Store predictions for detailed metrics
             all_predictions.extend(predicted.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
     
@@ -164,7 +138,6 @@ def parse_sweep_values(value_str, cast_type):
 
 
 def train(args):
-    """Main training function."""
     run_name = args.run_name or args.model
     print("=" * 70)
     print(f"Training {args.model.upper()} model")
@@ -177,7 +150,6 @@ def train(args):
     print(f"Run name: {run_name}")
     print("=" * 70)
     
-    # Load data
     print("\nLoading data...")
     data_loaders = get_data_loaders(batch_size=args.batch_size)
     mappings = load_label_mappings()
@@ -187,7 +159,6 @@ def train(args):
     print(f"   Train batches: {len(data_loaders['train'])}")
     print(f"   Val batches: {len(data_loaders['val'])}")
     
-    # Create model
     print(f"\nCreating {args.model} model...")
     if args.model == 'lyrics_only':
         model = LyricsOnlyModel(num_classes, freeze_bert=args.freeze_bert)
@@ -198,35 +169,53 @@ def train(args):
     else:
         raise ValueError(f"Unknown model type: {args.model}")
     
-    # Clear cache before moving model to GPU
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         
     model = model.to(DEVICE)
     
-    # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"   Total parameters: {trainable_params:,} (trainable) / {total_params:,} (total)")
     
-    # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
+    if USE_WEIGHTED_LOSS and 'class_weights' in data_loaders and data_loaders['class_weights'] is not None:
+        print(f"   Using weighted CrossEntropyLoss with weights: {data_loaders['class_weights']}")
+        class_weights = data_loaders['class_weights'].to(DEVICE)
+        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
+    else:
+        print(f"   Using standard CrossEntropyLoss (label_smoothing={LABEL_SMOOTHING})")
+        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    
+    if hasattr(model, 'get_optimizer_parameters'):
+        print("   Using model-specific optimizer parameter grouping")
+        optimizer_params = model.get_optimizer_parameters(WEIGHT_DECAY)
+    else:
+        optimizer_params = model.parameters()
     
     optimizer = optim.AdamW(
-        model.parameters(),
+        optimizer_params,
         lr=args.lr,
         weight_decay=args.weight_decay
     )
     
-    # Learning rate scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=2
     )
     
-    # Tensorboard
     writer = SummaryWriter(os.path.join(LOG_DIR, run_name))
     
-    # Training loop
+    history = {
+        'train_loss': [],
+        'train_acc': [],
+        'train_bal_acc': [],
+        'train_f1': [],
+        'val_loss': [],
+        'val_acc': [],
+        'val_bal_acc': [],
+        'val_f1': [],
+        'learning_rates': []
+    }
+
     print(f"\nStarting training...\n")
     best_val_acc = 0.0
     patience_counter = 0
@@ -237,20 +226,29 @@ def train(args):
         print(f"Epoch {epoch+1}/{args.epochs}")
         print(f"{'='*70}")
         
-        # Train
         train_loss, train_acc, train_bal_acc, train_f1 = train_epoch(
             model, data_loaders['train'], criterion, optimizer, DEVICE, args.model
         )
         
-        # Validate
         val_loss, val_acc, val_bal_acc, val_f1, _, _ = evaluate(
             model, data_loaders['val'], criterion, DEVICE, args.model
         )
         
-        # Update learning rate
         scheduler.step(val_loss)
         
-        # Log to tensorboard
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['train_bal_acc'].append(train_bal_acc)
+        history['train_f1'].append(train_f1)
+        
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        history['val_bal_acc'].append(val_bal_acc)
+        history['val_f1'].append(val_f1)
+        
+        current_lr = optimizer.param_groups[0]['lr']
+        history['learning_rates'].append(current_lr)
+
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/val', val_loss, epoch)
         writer.add_scalar('Accuracy/train', train_acc, epoch)
@@ -259,19 +257,11 @@ def train(args):
         writer.add_scalar('Balanced_Accuracy/val', val_bal_acc, epoch)
         writer.add_scalar('F1/train', train_f1, epoch)
         writer.add_scalar('F1/val', val_f1, epoch)
-        writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], epoch)
+        writer.add_scalar('Learning_rate', current_lr, epoch)
         
-        # Print results
         print(f"\nEpoch {epoch+1} Results:")
         print(f"   Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}% | Bal Acc: {train_bal_acc:.2f}% | F1: {train_f1:.2f}")
         print(f"   Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}% | Bal Acc: {val_bal_acc:.2f}% | F1: {val_f1:.2f}")
-        
-        # Save best model using balanced accuracy or f1 can be better for imbalanced datasets
-        # But sticking to val_acc for now as per request or switching to f1?
-        # The plan says "Ensure the model achieves >40% Balanced Accuracy", let's use Bal Acc for saving best model?
-        # The code currently uses val_acc. I will stick to val_acc for consistency but log others.
-        # Actually, for imbalanced datasets, saving best model based on F1 or Bal Acc is better.
-        # Let's switch to Balanced Accuracy for model selection.
         
         current_score = val_bal_acc
         
@@ -295,17 +285,14 @@ def train(args):
         else:
             patience_counter += 1
         
-        # Early stopping
         if patience_counter >= EARLY_STOPPING_PATIENCE:
             print(f"\nEarly stopping triggered after {epoch+1} epochs")
             break
     
-    # Final evaluation on test set
     print(f"\n{'='*70}")
     print("Final Evaluation on Test Set")
     print(f"{'='*70}")
     
-    # Load best model
     if SAVE_BEST_MODEL and best_model_path and os.path.exists(best_model_path):
         checkpoint = torch.load(best_model_path)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -314,13 +301,14 @@ def train(args):
         model, data_loaders['test'], criterion, DEVICE, args.model
     )
     
+    cm = confusion_matrix(test_labels, test_preds)
+    
     print(f"\nTest Results:")
     print(f"   Test Loss: {test_loss:.4f}")
     print(f"   Test Accuracy: {test_acc:.2f}%")
     print(f"   Test Bal Acc: {test_bal_acc:.2f}%")
     print(f"   Test F1 Score: {test_f1:.2f}")
     
-    # Save results
     results = {
         'model': args.model,
         'run_name': run_name,
@@ -332,7 +320,9 @@ def train(args):
         'num_classes': num_classes,
         'total_params': total_params,
         'trainable_params': trainable_params,
-        'best_model_path': best_model_path
+        'best_model_path': best_model_path,
+        'history': history,
+        'confusion_matrix': cm.tolist()
     }
     
     results_path = os.path.join(MODEL_DIR, f'{run_name}_results.json')
@@ -340,6 +330,16 @@ def train(args):
         json.dump(results, f, indent=2)
     
     print(f"\nResults saved to {results_path}")
+
+    try:
+        from utils.plotting import plot_training_results
+        print("\nGenerating training plots...")
+        plot_training_results(results_path)
+    except ImportError:
+        print("\nWarning: Could not import plotting utility. Skipping plot generation.")
+    except Exception as e:
+        print(f"\nWarning: Failed to generate plots: {e}")
+    
     print(f"\nTraining complete!")
     
     writer.close()
@@ -348,10 +348,9 @@ def train(args):
 
 
 def run_sweep(args):
-    """Run simple grid search over provided hyperparameters."""
     lr_values = parse_sweep_values(args.sweep_lrs, float) or [args.lr]
     batch_values = parse_sweep_values(args.sweep_batch_sizes, int) or [args.batch_size]
-    wd_values = parse_sweep_values(args.sweep_weight_decays, float) or [args.weight_decay]
+    wd_values = parse_sweep_values(args.sweep_weight_decays, float) or [WEIGHT_DECAY]
     
     best_score = -float('inf')
     best_config = None
@@ -361,18 +360,17 @@ def run_sweep(args):
         sweep_args = copy.deepcopy(args)
         sweep_args.lr = lr
         sweep_args.batch_size = batch
-        sweep_args.weight_decay = wd
         
         base_name = args.run_name or args.model
         lr_tag = str(lr).replace('.', 'p')
         sweep_args.run_name = f"{base_name}_bs{batch}_lr{lr_tag}_wd{wd}"
         
         print("\n" + "=" * 70)
-        print(f"SWEEP RUN: lr={lr}, batch={batch}, weight_decay={wd}")
+        print(f"SWEEP RUN: lr={lr}, batch={batch}, weight_decay={WEIGHT_DECAY}")
         print("=" * 70)
         
         result = train(sweep_args)
-        val_acc = result['best_val_accuracy']
+        val_acc = result['best_val_balanced_accuracy']
         summary.append((lr, batch, wd, val_acc, result['run_name']))
         
         if val_acc > best_score:
@@ -381,11 +379,11 @@ def run_sweep(args):
     
     print("\nSweep summary:")
     for lr, batch, wd, acc, run_name in summary:
-        print(f"  Run {run_name}: lr={lr}, batch={batch}, weight_decay={wd} -> Val Acc {acc:.2f}%")
+        print(f"  Run {run_name}: lr={lr}, batch={batch}, weight_decay={WEIGHT_DECAY} -> Val Acc {acc:.2f}%")
     
     if best_config:
         lr, batch, wd, run_name = best_config
-        print(f"\nBest config: lr={lr}, batch={batch}, weight_decay={wd}, run={run_name}, val_acc={best_score:.2f}%")
+        print(f"\nBest config: lr={lr}, batch={batch}, weight_decay={WEIGHT_DECAY}, run={run_name}, val_ {best_score:.2f}%")
     else:
         print("\nNo sweep runs executed.")
 
