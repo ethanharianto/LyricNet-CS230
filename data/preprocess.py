@@ -1,16 +1,5 @@
 """
 Preprocess Spotify dataset for LyricNet.
-
-This script performs the following steps:
-1. Loads the raw Kaggle dataset
-2. Cleans and filters the data
-3. Handles missing values
-4. Balances emotion classes
-5. Splits into train/val/test sets
-6. Saves processed data
-
-Usage:
-    python data/preprocess.py
 """
 
 import os
@@ -97,7 +86,6 @@ AUGMENTATION_SYNONYM_MAP = {
 
 
 def load_raw_data():
-    """Load the raw Kaggle dataset."""
     print("Loading raw data...")
     
     # Find CSV file in raw data directory
@@ -108,7 +96,6 @@ def load_raw_data():
         print("   Please run data/download_kaggle.py first")
         return None
     
-    # Use the first CSV file (or you can specify the exact filename)
     data_file = os.path.join(RAW_DATA_DIR, csv_files[0])
     print(f"   Loading: {csv_files[0]}")
     
@@ -119,7 +106,7 @@ def load_raw_data():
 
 
 def explore_data(df):
-    """Perform exploratory data analysis to understand the data structure."""
+    """Perform exploratory data analysis."""
     print("\nData Exploration")
     print("-" * 60)
     
@@ -138,7 +125,6 @@ def explore_data(df):
     else:
         print("   No missing values!")
     
-    # Check for emotion column (might be named differently)
     emotion_cols = [col for col in df.columns if 'emotion' in col.lower() or 'mood' in col.lower()]
     if emotion_cols:
         print(f"\nEmotion-related columns: {emotion_cols}")
@@ -146,7 +132,6 @@ def explore_data(df):
             print(f"\n   Distribution of '{col}':")
             print(df[col].value_counts())
     
-    # Check for lyric column
     lyric_cols = [col for col in df.columns if 'lyric' in col.lower() or 'text' in col.lower()]
     if lyric_cols:
         print(f"\nLyric-related columns: {lyric_cols}")
@@ -159,15 +144,10 @@ def explore_data(df):
 
 
 def clean_data(df):
-    """Clean and filter the dataset."""
     print("\nCleaning data...")
     
     initial_size = len(df)
     
-    # You'll need to adjust these column names based on your actual dataset
-    # Common names: 'lyrics', 'text', 'emotion', 'mood', 'genre', etc.
-    
-    # Try to identify the correct column names
     possible_lyric_cols = ['lyrics', 'lyric', 'text', 'song_lyrics']
     possible_emotion_cols = ['emotion', 'mood', 'sentiment', 'emotions']
     
@@ -240,16 +220,15 @@ def clean_data(df):
     valid_emotions = emotion_counts[emotion_counts >= MIN_SAMPLES_PER_CLASS].index.tolist()
     
     if len(valid_emotions) == 0:
-        # Fall back to top-k classes if nothing meets threshold
         top_k = min(8, len(emotion_counts))
         valid_emotions = emotion_counts.index[:top_k].tolist()
         print(f"   WARNING: No classes met MIN_SAMPLES_PER_CLASS. Keeping top {top_k} classes instead.")
     
     df = df[df[emotion_col].isin(valid_emotions)]
-    print(f"   Kept {len(valid_emotions)} emotion classes with >= {MIN_SAMPLES_PER_CLASS} samples (or top frequency fallback)")
+    print(f"   Kept {len(valid_emotions)} emotion classes with >= {MIN_SAMPLES_PER_CLASS} samples")
     print(f"   Classes: {sorted(valid_emotions)}")
 
-    # Optional synonym-based augmentation to inject lexical variety
+    # Optional synonym-based augmentation
     df, augmentations = maybe_augment_lyrics(df, lyric_col, emotion_col)
     if augmentations:
         print(f"   Added {augmentations:,} augmented lyric samples")
@@ -377,12 +356,10 @@ def extract_audio_features(df):
     """Extract and normalize Spotify audio features."""
     print("\nExtracting audio features...")
     
-    # Map dataset column names to our expected feature names
-    # This dataset has different naming conventions
     column_mapping = {
         'Energy': 'energy',
         'Danceability': 'danceability',
-        'Positiveness': 'valence',  # Dataset uses "Positiveness" instead of "valence"
+        'Positiveness': 'valence',
         'Tempo': 'tempo',
         'Loudness (db)': 'loudness',
         'Speechiness': 'speechiness',
@@ -390,20 +367,16 @@ def extract_audio_features(df):
         'Instrumentalness': 'instrumentalness',
         'Liveness': 'liveness',
         'Key': 'key',
-        # Note: 'mode' is not in this dataset, will fill with 0
     }
     
-    # Create audio feature matrix
     audio_df = pd.DataFrame()
     available_features = []
     missing_features = []
     
     for expected_name in AUDIO_FEATURES:
-        # Find the actual column name in the dataset
         found = False
         for dataset_col, mapped_name in column_mapping.items():
             if mapped_name == expected_name and dataset_col in df.columns:
-                # Extract and convert to numeric
                 values = pd.to_numeric(df[dataset_col], errors='coerce').fillna(0)
                 audio_df[expected_name] = values
                 available_features.append(expected_name)
@@ -411,7 +384,6 @@ def extract_audio_features(df):
                 break
         
         if not found:
-            # Feature not available, fill with 0
             audio_df[expected_name] = 0
             missing_features.append(expected_name)
     
@@ -421,9 +393,8 @@ def extract_audio_features(df):
     if missing_features:
         print(f"   Missing: {missing_features}")
     
-    # Normalize features to [0, 1] range
     for col in audio_df.columns:
-        if col not in ['key', 'mode']:  # Don't normalize categorical features
+        if col not in ['key', 'mode']:
             min_val = audio_df[col].min()
             max_val = audio_df[col].max()
             if max_val > min_val:
@@ -435,15 +406,12 @@ def extract_audio_features(df):
 
 
 def split_data(df, lyric_col, emotion_col, audio_features_df):
-    """Split into train/val/test sets with stratification."""
     print("\nSplitting data...")
     
-    # Prepare features
     X_lyrics = df[lyric_col].values
     X_audio = audio_features_df.values
     y = df[emotion_col].values
     
-    # Create emotion label mapping
     unique_emotions = sorted(df[emotion_col].unique())
     emotion_to_id = {emotion: idx for idx, emotion in enumerate(unique_emotions)}
     id_to_emotion = {idx: emotion for emotion, idx in emotion_to_id.items()}
@@ -454,7 +422,6 @@ def split_data(df, lyric_col, emotion_col, audio_features_df):
         count = (y == emotion).sum()
         print(f"      {emotion}: {count:,} samples ({count/len(y)*100:.1f}%)")
     
-    # First split: train vs. (val + test)
     X_lyrics_train, X_lyrics_temp, X_audio_train, X_audio_temp, y_train, y_temp = train_test_split(
         X_lyrics, X_audio, y_encoded,
         test_size=(VAL_SPLIT + TEST_SPLIT),
@@ -462,7 +429,6 @@ def split_data(df, lyric_col, emotion_col, audio_features_df):
         random_state=RANDOM_SEED
     )
     
-    # Second split: val vs. test
     val_ratio = VAL_SPLIT / (VAL_SPLIT + TEST_SPLIT)
     X_lyrics_val, X_lyrics_test, X_audio_val, X_audio_test, y_val, y_test = train_test_split(
         X_lyrics_temp, X_audio_temp, y_temp,
@@ -485,12 +451,10 @@ def split_data(df, lyric_col, emotion_col, audio_features_df):
 
 
 def save_processed_data(splits):
-    """Save processed data to disk."""
     print("\nSaving processed data...")
     
     os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
     
-    # Save each split
     for split_name in ['train', 'val', 'test']:
         data = splits[split_name]
         
@@ -499,17 +463,14 @@ def save_processed_data(splits):
             'labels': data['labels']
         })
         
-        # Save audio features separately (as numpy array for efficiency)
         audio_path = os.path.join(PROCESSED_DATA_DIR, f'{split_name}_audio.npy')
         np.save(audio_path, data['audio'])
         
-        # Save main data
         csv_path = os.path.join(PROCESSED_DATA_DIR, f'{split_name}.csv')
         df.to_csv(csv_path, index=False)
         
         print(f"   Saved {split_name}: {len(df):,} samples")
     
-    # Save label mappings
     import json
     mappings = {
         'emotion_to_id': splits['emotion_to_id'],

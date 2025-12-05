@@ -17,7 +17,8 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from config import (
     PROCESSED_DATA_DIR, MAX_LYRIC_LENGTH, 
-    BERT_MODEL_NAME, BATCH_SIZE
+    BERT_MODEL_NAME, BATCH_SIZE,
+    USE_WEIGHTED_SAMPLER, SAMPLER_ALPHA
 )
 
 
@@ -25,20 +26,9 @@ class LyricDataset(Dataset):
     """PyTorch Dataset for lyrics and audio features."""
     
     def __init__(self, split='train', tokenizer=None):
-        """
-        Initialize dataset.
-        
-        Args:
-            split: Data split - 'train', 'val', or 'test'
-            tokenizer: BERT tokenizer instance (creates new one if None)
-        """
         self.split = split
-        
-        # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL_NAME)
 
-        
-        # Load data
         csv_path = os.path.join(PROCESSED_DATA_DIR, f'{split}.csv')
         audio_path = os.path.join(PROCESSED_DATA_DIR, f'{split}_audio.npy')
         
@@ -53,40 +43,26 @@ class LyricDataset(Dataset):
         
         print(f"Loaded {split} set: {len(self.data)} samples")
         
-        # Compute class weights for balancing
         if split == 'train':
             self._compute_weights()
     
     def _compute_weights(self):
-        """Compute sample weights for weighted random sampling."""
         labels = self.data['labels'].values
         class_counts = np.bincount(labels)
-        total_samples = len(labels)
         
-        # Weight = 1 / class_frequency
-        class_weights = 1.0 / class_counts
+        # Calculate weights proportional to N^(alpha-1)
+        exponent = SAMPLER_ALPHA - 1.0
+        class_weights = np.power(class_counts, exponent)
         
-        # Assign weight to each sample based on its label
         self.sample_weights = torch.from_numpy(class_weights[labels]).float()
-        print(f"Computed sample weights for {len(self.sample_weights)} samples")
-    
+        print(f"Computed sample weights (alpha={SAMPLER_ALPHA}) for {len(self.sample_weights)} samples")
+        
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
-        """
-        Get a single data sample.
-        
-        Returns:
-            Dictionary containing:
-                - input_ids: BERT token IDs
-                - attention_mask: BERT attention mask
-                - audio_features: Spotify audio features
-                - label: Emotion class ID
-        """
         row = self.data.iloc[idx]
         
-        # Tokenize lyrics
         lyrics = str(row['lyrics'])
         encoding = self.tokenizer.encode_plus(
             lyrics,
@@ -98,10 +74,7 @@ class LyricDataset(Dataset):
             return_tensors='pt'
         )
         
-        # Get audio features
         audio = torch.FloatTensor(self.audio_features[idx])
-        
-        # Get label
         label = torch.LongTensor([row['labels']])[0]
         
         return {
@@ -113,36 +86,29 @@ class LyricDataset(Dataset):
 
 
 def get_data_loaders(batch_size=BATCH_SIZE, num_workers=0):
-    """
-    Create train, validation, and test data loaders.
-    
-    Args:
-        batch_size: Batch size for training
-        num_workers: Number of workers for data loading (use 0 for MPS/Mac compatibility)
-    
-    Returns:
-        Dictionary with 'train', 'val', 'test' DataLoaders and 'tokenizer'
-    """
-    # Create tokenizer (shared across all splits)
     tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL_NAME)
     
-    # Create datasets
     train_dataset = LyricDataset('train', tokenizer)
     val_dataset = LyricDataset('val', tokenizer)
     test_dataset = LyricDataset('test', tokenizer)
     
-    # Create data loaders
-    # Use WeightedRandomSampler for training to handle class imbalance
-    sampler = torch.utils.data.WeightedRandomSampler(
-        weights=train_dataset.sample_weights,
-        num_samples=len(train_dataset),
-        replacement=True
-    )
+    sampler = None
+    shuffle = True
+    
+    if USE_WEIGHTED_SAMPLER:
+        print(f"Using WeightedRandomSampler with alpha={SAMPLER_ALPHA}")
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=train_dataset.sample_weights,
+            num_samples=len(train_dataset),
+            replacement=True
+        )
+        shuffle = False
     
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        sampler=sampler,  # mutually exclusive with shuffle
+        sampler=sampler,
+        shuffle=shuffle,
         num_workers=num_workers
     )
     
@@ -169,7 +135,6 @@ def get_data_loaders(batch_size=BATCH_SIZE, num_workers=0):
 
 
 def load_label_mappings():
-    """Load emotion label mappings from processed data directory."""
     mapping_path = os.path.join(PROCESSED_DATA_DIR, 'label_mappings.json')
     
     if not os.path.exists(mapping_path):
@@ -182,39 +147,4 @@ def load_label_mappings():
         mappings = json.load(f)
     
     return mappings
-
-
-if __name__ == "__main__":
-    """Test data loading functionality."""
-    print("Testing data loader...")
-    
-    # Load label mappings
-    mappings = load_label_mappings()
-    print(f"\nEmotion classes ({mappings['num_classes']}):")
-    for emotion_id, emotion_name in mappings['id_to_emotion'].items():
-        print(f"  {emotion_id}: {emotion_name}")
-    
-    # Create data loaders
-    loaders = get_data_loaders(batch_size=4)
-    
-    # Test train loader
-    print("\nTesting train loader...")
-    
-    # Check balance of a larger batch
-    balanced_loader = get_data_loaders(batch_size=100)['train']
-    batch = next(iter(balanced_loader))
-    labels = batch['label']
-    
-    print(f"  Batch size: {len(labels)}")
-    print(f"  Label counts in batch: {torch.bincount(labels)}")
-    
-    batch = next(iter(loaders['train']))
-    
-    print(f"  Input IDs shape: {batch['input_ids'].shape}")
-    print(f"  Attention mask shape: {batch['attention_mask'].shape}")
-    print(f"  Audio features shape: {batch['audio_features'].shape}")
-    print(f"  Labels shape: {batch['label'].shape}")
-    print(f"  Sample labels: {batch['label'].tolist()}")
-    
-    print("\nData loader test passed successfully!")
 
