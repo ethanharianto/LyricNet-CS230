@@ -35,8 +35,9 @@ class LyricsOnlyModel(nn.Module):
                 param.requires_grad = False
             
             # Unfreeze specific layers
-            for param in self.bert.encoder.layer[6].parameters():
-                param.requires_grad = True
+            for layer in range(5,6):
+                for param in self.bert.encoder.layer[layer].parameters():
+                    param.requires_grad = True
             for param in self.bert.pooler.parameters():
                 param.requires_grad = True
             self.bert.eval()

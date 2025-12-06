@@ -23,12 +23,12 @@ def set_publication_style():
         # Typography
         'font.family': 'serif',
         'font.serif': ['Times New Roman', 'Times', 'DejaVu Serif'],
-        'font.size': 10,
-        'axes.labelsize': 11,
-        'axes.titlesize': 12,
-        'legend.fontsize': 9,
-        'xtick.labelsize': 9,
-        'ytick.labelsize': 9,
+        'font.size': 15,
+        'axes.labelsize': 15,
+        'axes.titlesize': 15,
+        'legend.fontsize': 15,
+        'xtick.labelsize': 15,
+        'ytick.labelsize': 15,
         
         # LaTeX support
         'text.usetex': False,
@@ -146,7 +146,7 @@ def _plot_confusion_matrix(cm, labels, run_name, output_dir):
         cbar_kws={'label': 'Normalized Frequency', 'shrink': 0.8},
         linewidths=0.5,
         linecolor='black',
-        annot_kws={"size": 9}
+        annot_kws={"size": 14}
     )
     
     plt.title(f"Confusion Matrix: {run_name}")
